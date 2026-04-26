@@ -1,0 +1,172 @@
+"""
+多股票回测主程序
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import logging
+from logging_config import setup_logging, log_performance_metrics
+from data_fetcher import DataFetcher
+from strategy import MACD_ATR_Strategy
+from multi_stock_optimizer import MultiStockParameterOptimizer
+
+def main():
+    # 配置日志
+    logger = setup_logging(log_dir="./logs", log_level="INFO")
+    
+    logger.info("=" * 70)
+    logger.info("多股票MACD+ATR策略参数优化回测程序")
+    logger.info("=" * 70)
+    
+    # 配置参数
+    stock_pool = [
+        'sh.601939',   # 建设银行
+        # 'sh.600000',  # 浦发银行
+        'sh.600036',  # 招商银行  
+        # 'sz.000001',  # 平安银行
+        # 'sz.000002',  # 万科A
+        # 'sh.600519',  # 贵州茅台（高价股，测试限购）
+    #    'sz.000858',  # 五粮液
+    #    'sh.600276',  # 恒瑞医药
+    #    'sz.000333',  # 美的集团
+    #    'sh.601318',  # 中国平安
+        # 'sh.600887',  # 伊利股份
+        # 'sz.000651',  # 格力电器
+        # 'sh.600030',  # 中信证券
+        # 'sh.600837',  # 海通证券
+        # 'sz.000776',  # 广发证券
+        # 'sh.601166',  # 兴业银行
+    ]
+    
+    start_date = '2023-01-01'
+    end_date = '2025-12-31'  # 4年数据
+    fixed_buy_amount = 50000.0  # 每次买入5万元左右
+    warmup_days = 100  # 预热数据天数
+    
+    logger.info(f"股票池数量: {len(stock_pool)} 只")
+    logger.info(f"回测周期: {start_date} 至 {end_date}")
+    logger.info(f"初始资金: 1,00,000 元")
+    logger.info(f"单次买入金额: {fixed_buy_amount:.0f} 元")
+    logger.info(f"高价股限购: 股价 > 500元时只买100股")
+    logger.info("=" * 70)
+    
+    # 参数网格
+    param_grid = {
+        'fast_period': [8, 10, 12],           # F
+        'slow_period': [20, 24, 26],          # M
+        'signal_period': [6, 8, 9],           # SIG
+        'profit_multiplier': [1.0, 1.5, 2.0], # Y
+        'stop_loss_multiplier': [0.5, 1.0, 1.5] # S
+    }
+    
+    # 初始化模块
+    data_fetcher = DataFetcher(max_workers=5, cache_dir="./data_cache")
+    strategy = MACD_ATR_Strategy()
+    optimizer = MultiStockParameterOptimizer(data_fetcher, strategy)
+    
+    # 登录baostock
+    if not data_fetcher.login():
+        logger.error("登录失败，程序退出")
+        return
+    
+    try:
+        # 步骤1: 参数优化
+        logger.info("\n步骤1: 参数优化")
+        logger.info("-" * 50)
+        
+        best_params, opt_results = optimizer.optimize_parameters(
+            stock_pool, start_date, end_date, param_grid, fixed_buy_amount, warmup_days
+        )
+        
+        if best_params is None:
+            logger.error("未找到有效参数组合")
+            return
+        
+        fast, slow, signal, profit_mult, stop_mult = best_params
+        logger.info(f"最优参数组合:")
+        logger.info(f"  快线周期(F): {fast}")
+        logger.info(f"  慢线周期(M): {slow}")
+        logger.info(f"  信号周期(SIG): {signal}")
+        logger.info(f"  止盈倍数(Y): {profit_mult}")
+        logger.info(f"  止损倍数(S): {stop_mult}")
+        
+        # 保存优化结果
+        opt_results.to_csv('multi_stock_optimization.csv', index=False, encoding='utf-8-sig')
+        logger.info(f"保存优化结果: multi_stock_optimization.csv")
+        
+        # 显示前10个最佳组合
+        logger.info("前10个最佳参数组合:")
+        logger.info(opt_results.head(10).round(4).to_string(index=False))
+        
+        # 步骤2: 在测试集上验证
+        logger.info("\n步骤2: 参数验证")
+        logger.info("-" * 50)
+        
+        # 使用后30%数据作为测试集
+        test_start = '2025-01-01'  # 假设最后一年为测试集
+        validation_results = optimizer.validate_parameters(
+            stock_pool, test_start, end_date, best_params, fixed_buy_amount, warmup_days
+        )
+        
+        if validation_results:
+            log_performance_metrics(logger, validation_results, "测试集")
+        
+        # 步骤3: 完整周期回测
+        logger.info("\n步骤3: 完整周期回测")
+        logger.info("-" * 50)
+        
+        full_results, stock_analysis = optimizer.run_full_backtest(
+            stock_pool, start_date, end_date, best_params, fixed_buy_amount, warmup_days
+        )
+        
+        if full_results:
+            log_performance_metrics(logger, full_results, "完整周期")
+            
+            # 保存详细结果
+            trade_records_df = pd.DataFrame(full_results['trade_records'])
+            if not trade_records_df.empty:
+                trade_records_df.to_csv('multi_stock_trades.csv', index=False, encoding='utf-8-sig')
+                logger.info(f"保存交易记录: multi_stock_trades.csv ({len(trade_records_df)}笔交易)")
+            
+            # 保存股票分析
+            if not stock_analysis.empty:
+                stock_analysis.to_csv('multi_stock_analysis.csv', index=False, encoding='utf-8-sig')
+                logger.info(f"保存股票分析: multi_stock_analysis.csv")
+                
+                logger.info("表现最佳的5只股票:")
+                logger.info(stock_analysis.nlargest(5, 'total_pnl').to_string(index=False))
+            
+            # 保存权益曲线
+            equity_df = pd.DataFrame({
+                'date': full_results['equity_dates'],
+                'equity': full_results['equity_curve'][1:]  # 跳过初始值
+            })
+            equity_df.to_csv('multi_stock_equity.csv', index=False, encoding='utf-8-sig')
+            logger.info(f"保存权益曲线: multi_stock_equity.csv")
+            
+            # 参数敏感性分析
+            logger.info("参数敏感性分析:")
+            for col in ['fast_period', 'slow_period', 'signal_period', 'profit_multiplier', 'stop_loss_multiplier']:
+                if col in opt_results.columns:
+                    top_3 = opt_results.nlargest(3, 'score')[col].unique()
+                    logger.info(f"  {col}: 最佳值通常在 {list(top_3)}")
+        
+        logger.info("\n" + "=" * 70)
+        logger.info("回测完成!")
+        logger.info("=" * 70)
+        
+    except Exception as e:
+        logger.error(f"回测过程中出现错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+    finally:
+        data_fetcher.logout()
+
+if __name__ == "__main__":
+    print("注意：运行前请确保已安装必要库:")
+    print("pip install baostock pandas numpy")
+    print("=" * 70)
+    
+    main()
