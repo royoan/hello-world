@@ -1,0 +1,122 @@
+"""
+日志配置模块
+统一配置整个回测系统的日志格式和级别
+"""
+
+import logging
+import logging.handlers
+import os
+import sys
+from datetime import datetime
+
+def setup_logging(log_dir: str = "./logs", log_level: str = "INFO"):
+    """
+    配置日志系统
+    
+    参数:
+        log_dir: 日志文件目录
+        log_level: 日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    """
+    # 确保日志目录存在
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # 设置日志级别
+    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    
+    # 创建主logger
+    logger = logging.getLogger()
+    logger.setLevel(numeric_level)
+    
+    # 清除已有的handler，避免重复
+    logger.handlers.clear()
+    
+    # 定义日志格式
+    formatter = logging.Formatter(
+        fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(numeric_level)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # 文件处理器 - 所有日志
+    log_file = os.path.join(log_dir, f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(numeric_level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # 错误日志单独文件
+    error_log_file = os.path.join(log_dir, f"error_{datetime.now().strftime('%Y%m%d')}.log")
+    error_handler = logging.FileHandler(error_log_file, encoding='utf-8')
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    logger.addHandler(error_handler)
+    
+    # 日志回滚 - 最多保留10个文件，每个文件10MB
+    backup_count = 10
+    max_bytes = 10 * 1024 * 1024  # 10MB
+    
+    # 回滚处理器 - 主日志
+    rotate_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(log_dir, "backtest_main.log"),
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding='utf-8'
+    )
+    rotate_handler.setLevel(numeric_level)
+    rotate_handler.setFormatter(formatter)
+    logger.addHandler(rotate_handler)
+    
+    # 记录日志系统启动信息
+    logger.info(f"日志系统初始化完成，日志级别: {log_level}")
+    logger.info(f"日志目录: {log_dir}")
+    logger.info(f"主日志文件: {log_file}")
+    logger.info(f"错误日志文件: {error_log_file}")
+    
+    return logger
+
+def get_module_logger(module_name: str):
+    """
+    获取模块专用的logger
+    
+    参数:
+        module_name: 模块名称，通常是 __name__
+    """
+    return logging.getLogger(module_name)
+
+def log_performance_metrics(logger, metrics: dict, prefix: str = ""):
+    """格式化记录绩效指标"""
+    if not metrics:
+        return
+    
+    logger.info(f"{prefix}绩效指标:")
+    logger.info(f"{prefix}  最终权益: {metrics.get('final_equity', 0):,.2f}元")
+    logger.info(f"{prefix}  总收益率: {metrics.get('total_return', 0):.2%}")
+    logger.info(f"{prefix}  年化收益: {metrics.get('annual_return', 0):.2%}")
+    logger.info(f"{prefix}  最大回撤: {metrics.get('max_drawdown', 0):.2%}")
+    logger.info(f"{prefix}  夏普比率: {metrics.get('sharpe_ratio', 0):.2f}")
+    logger.info(f"{prefix}  胜率: {metrics.get('win_rate', 0):.2%}")
+    logger.info(f"{prefix}  交易次数: {metrics.get('trade_count', 0)}")
+    
+    if 'avg_position_count' in metrics:
+        logger.info(f"{prefix}  平均持仓数: {metrics.get('avg_position_count', 0):.1f}")
+    if 'profit_trades' in metrics:
+        logger.info(f"{prefix}  盈利交易: {metrics.get('profit_trades', 0)}")
+
+def log_trade_details(logger, trade_record: dict):
+    """格式化记录交易详情"""
+    action = trade_record.get('action', '')
+    stock_code = trade_record.get('stock_code', '')
+    price = trade_record.get('price', 0)
+    shares = trade_record.get('shares', 0)
+    pnl_pct = trade_record.get('pnl_pct', 0)
+    
+    if action == 'BUY':
+        logger.info(f"买入 {stock_code}: {shares}股 @ {price:.2f}元")
+    elif action.startswith('SELL'):
+        logger.info(f"卖出 {stock_code}: {shares}股 @ {price:.2f}元, 盈亏: {pnl_pct:.2%}")
