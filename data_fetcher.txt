@@ -1,0 +1,569 @@
+"""
+数据获取模块 - 带本地缓存功能
+优先从本地CSV文件读取，若无则从baostock下载并保存到本地
+文件名格式：股票代码_开始日期_结束日期_5m.csv（5分钟数据）
+          股票代码_开始日期_结束日期_d.csv（日线数据）
+"""
+
+import baostock as bs
+import pandas as pd
+import os
+import glob
+from datetime import timedelta
+import warnings
+from typing import List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+from logging_config import setup_logging
+warnings.filterwarnings('ignore')
+
+# 获取模块logger
+logger = logging.getLogger(__name__)
+
+class DataFetcher:
+    """数据获取器，支持本地缓存和多股票并发获取"""
+    
+
+    # 包含: 日期(date)、股票代码(code)、开盘价(open)、最高价(high)、最低价(low)、收盘价(close)、
+    #       成交量(volume)、成交额(amount)、涨跌幅(pctChg),
+    #      换手率 turn	，滚动市盈率peTTM，pbMRQ	市净率， psTTM	滚动市销率， pcfNcfTTM	滚动市现率，复权标志(adjustflag=2前复权)
+    STOCK_DAY_FIELDS  = "date,open,high,low,close,volume,amount,turn,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM"
+    STOCK_MIN_FIELDS  = "time,open,high,low,close,volume,amount"
+
+    #指数日线数据列 http://www.baostock.com/mainContent?file=indexData.md
+    INDEX_DAY_FIELDS  = "date,open,high,low,close,preclose,volume,amount,pctChg" 
+
+    def __init__(self, max_workers: int = 5, cache_dir: str = "./data_cache"):
+        self.lg = None
+        self.max_workers = max_workers  # 最大并发数
+        self.cache_dir = cache_dir
+        self._ensure_cache_dir()
+        
+    def _ensure_cache_dir(self):
+        """确保缓存目录存在"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+            logger.info(f"创建缓存目录: {self.cache_dir}")
+    
+    def _get_cache_filename(self, stock_code: str, start_date: str, end_date: str, 
+                           data_type: str = "5m") -> str:
+        """
+        生成缓存文件名
+        
+        参数:
+            data_type: "d"表示日线数据, "5m"表示5分钟数据
+            
+        返回:
+            文件名格式: 股票代码_开始日期_结束日期_5m.csv
+        """
+        # 规范化日期格式
+        start_date_fmt = pd.to_datetime(start_date).strftime('%Y%m%d')
+        end_date_fmt = pd.to_datetime(end_date).strftime('%Y%m%d')
+        
+        # 生成文件名
+        filename = f"{stock_code}_{start_date_fmt}_{end_date_fmt}_{data_type}.csv"
+        return os.path.join(self.cache_dir, filename)
+    
+    def _load_from_local_cache(self, stock_code: str, start_date: str, end_date: str,
+                              data_type: str = "5m") -> pd.DataFrame:
+        """
+        从本地CSV文件加载数据
+        
+        返回:
+            如果找到完全匹配的缓存文件，返回DataFrame
+            否则返回空DataFrame
+        """
+        cache_file = self._get_cache_filename(stock_code, start_date, end_date, data_type)
+        
+        if os.path.exists(cache_file):
+            try:
+                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                logger.info(f"从本地缓存读取: {os.path.basename(cache_file)} ({len(df)} 行)")
+                return df
+            except Exception as e:
+                logger.error(f"读取缓存文件失败 {cache_file}: {e}")
+        
+        return pd.DataFrame()
+    
+    def _save_to_local_cache(self, df: pd.DataFrame, stock_code: str, 
+                            start_date: str, end_date: str, data_type: str = "5m"):
+        """保存数据到本地CSV文件"""
+        if df is None or df.empty:
+            logger.warning("尝试保存空数据到缓存，跳过")
+            return
+        
+        cache_file = self._get_cache_filename(stock_code, start_date, end_date, data_type)
+        
+        try:
+            df.to_csv(cache_file, encoding='utf-8')
+            logger.info(f"数据已保存到本地: {os.path.basename(cache_file)} ({len(df)} 行)")
+        except Exception as e:
+            logger.error(f"保存缓存文件失败 {cache_file}: {e}")
+    
+    def _find_best_cache(self, stock_code: str, start_date: str, end_date: str,
+                        data_type: str = "5m") -> Tuple[str, pd.DataFrame]:
+        """
+        查找最佳的缓存文件（可能包含所需时间范围）
+        
+        返回:
+            (最佳缓存文件路径, 对应的DataFrame)
+        """
+        # 查找该股票的所有缓存文件
+        pattern = f"{stock_code}_*_{data_type}.csv"
+        cache_files = glob.glob(os.path.join(self.cache_dir, pattern))
+        
+        if not cache_files:
+            logger.debug(f"未找到股票 {stock_code} 的 {data_type} 类型缓存文件")
+            return None, pd.DataFrame()
+        
+        # 解析文件名中的日期范围
+        best_file = None
+        best_df = None
+        best_coverage = 0  # 缓存覆盖所需范围的比例
+        
+        required_start = pd.to_datetime(start_date)
+        required_end = pd.to_datetime(end_date)
+        required_days = (required_end - required_start).days
+        
+        for cache_file in cache_files:
+            try:
+                # 解析文件名中的日期
+                filename = os.path.basename(cache_file)
+                parts = filename.split('_')
+                if len(parts) >= 4:
+                    file_start = pd.to_datetime(parts[1], format='%Y%m%d')
+                    file_end = pd.to_datetime(parts[2], format='%Y%m%d')
+                    
+                    # 检查缓存是否覆盖所需范围
+                    if file_start <= required_start and file_end >= required_end:
+                        # 完全覆盖，直接返回
+                        logger.debug(f"找到完全覆盖的缓存: {filename}")
+                        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                        return cache_file, df
+                    
+                    # 计算覆盖范围
+                    overlap_start = max(file_start, required_start)
+                    overlap_end = min(file_end, required_end)
+                    
+                    if overlap_start <= overlap_end:
+                        overlap_days = (overlap_end - overlap_start).days
+                        coverage = overlap_days / required_days if required_days > 0 else 0
+                        
+                        if coverage > best_coverage:
+                            best_coverage = coverage
+                            best_file = cache_file
+            except Exception as e:
+                logger.warning(f"解析缓存文件 {cache_file} 失败: {e}")
+                continue
+        
+        if best_file and best_coverage > 0.5:  # 覆盖超过50%则使用
+            try:
+                logger.info(f"使用部分覆盖的缓存: {os.path.basename(best_file)} (覆盖{best_coverage:.1%})")
+                df = pd.read_csv(best_file, index_col=0, parse_dates=True)
+                return best_file, df
+            except Exception as e:
+                logger.error(f"读取部分覆盖缓存失败 {best_file}: {e}")
+        
+        return None, pd.DataFrame()
+    
+    def login(self) -> bool:
+        """登录baostock系统"""
+        self.lg = bs.login()
+        if self.lg.error_code != '0':
+            logger.error(f"登录失败: {self.lg.error_msg}")
+            return False
+        logger.info("baostock登录成功")
+        return True
+    
+    def logout(self):
+        """登出baostock系统"""
+        if self.lg:
+            bs.logout()
+            logger.info("已登出baostock")
+    
+    def get_daily_data(self, stock_code: str, start_date: str, end_date: str, fields: str = STOCK_DAY_FIELDS) -> pd.DataFrame:
+        """
+        获取日线数据（带本地缓存）
+        
+        参数:
+            stock_code: 股票代码，如'sh.600000' (浦发银行)
+            start_date: 开始日期，格式'YYYY-MM-DD'
+            end_date: 结束日期，格式'YYYY-MM-DD'
+            
+        返回:
+            DataFrame包含日线数据
+        """
+        logger.debug(f"开始获取日线数据: {stock_code} {start_date}至{end_date}")
+        
+        # 1. 尝试从本地缓存读取完全匹配的文件
+        cached_df = self._load_from_local_cache(stock_code, start_date, end_date, "d")
+        if not cached_df.empty:
+            logger.debug(f"从缓存成功读取日线数据: {stock_code}, 数据量: {len(cached_df)}行")
+            return cached_df
+        
+        # 2. 尝试查找最佳的缓存文件（可能包含所需时间范围）
+        best_cache, best_df = self._find_best_cache(stock_code, start_date, end_date, "d")
+        if not best_df.empty:
+            # 检查是否完全覆盖
+            cache_start = best_df.index[0]
+            cache_end = best_df.index[-1]
+            required_start = pd.to_datetime(start_date)
+            required_end = pd.to_datetime(end_date)
+            
+            if cache_start <= required_start and cache_end >= required_end:
+                # 完全覆盖，直接返回
+                logger.info(f"使用缓存文件完全覆盖: {os.path.basename(best_cache)}")
+                return best_df[required_start:required_end]
+        
+        # 3. 缓存未命中，从远程获取
+        logger.info(f"从远程获取日线数据: {stock_code} {start_date}至{end_date}")
+        df = self._fetch_daily_data_remote(stock_code, start_date, end_date, fields)
+        
+        if df is not None and not df.empty:
+            # 保存到本地缓存
+            self._save_to_local_cache(df, stock_code, start_date, end_date, "d")
+            logger.info(f"日线数据获取完成: {stock_code}, 数据量: {len(df)}行")
+        else:
+            logger.warning(f"日线数据获取失败或为空: {stock_code}")
+        
+        return df
+    
+    def _fetch_daily_data_remote(self, stock_code: str, start_date: str, end_date: str, fields: str = STOCK_DAY_FIELDS) -> pd.DataFrame:
+        """远程获取日线数据"""
+        
+        try:
+            rs = bs.query_history_k_data_plus(
+                code=stock_code,
+                fields=fields,
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2"
+            )
+            
+            if rs.error_code != '0':
+                logger.error(f"获取日线数据失败 {stock_code}: {rs.error_msg}")
+                return pd.DataFrame()
+            
+            data_list = []
+            while rs.next():
+                data_list.append(rs.get_row_data())
+            
+            if not data_list:
+                logger.warning(f"日线数据为空: {stock_code}")
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+
+            numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg', 'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
+            for col in numeric_cols:
+                if col in df.columns:  # 先检查列是否存在
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            df = df[df['volume'] > 0]
+            df.sort_index(inplace=True)
+            
+            logger.debug(f"远程获取日线数据成功: {stock_code}, 数据量: {len(df)}行")
+            return df
+            
+        except Exception as e:
+            logger.error(f"远程获取日线数据异常 {stock_code}: {e}")
+            return pd.DataFrame()
+    
+    def get_5min_data(self, stock_code: str, start_date: str, end_date: str, fields: str = STOCK_MIN_FIELDS) -> pd.DataFrame:
+        """
+        获取5分钟数据（带本地缓存）
+        
+        参数:
+            stock_code: 股票代码
+            start_date: 开始日期
+            end_date: 结束日期
+            
+        返回:
+            DataFrame包含5分钟K线数据
+        """
+        logger.debug(f"开始获取5分钟数据: {stock_code} {start_date}至{end_date}")
+        
+        # 1. 尝试从本地缓存读取完全匹配的文件
+        cached_df = self._load_from_local_cache(stock_code, start_date, end_date, "5m")
+        if not cached_df.empty:
+            logger.debug(f"从缓存成功读取5分钟数据: {stock_code}, 数据量: {len(cached_df)}行")
+            return cached_df
+        
+        # 2. 尝试查找最佳的缓存文件（可能包含所需时间范围）
+        best_cache, best_df = self._find_best_cache(stock_code, start_date, end_date, "5m")
+        if not best_df.empty:
+            # 检查是否完全覆盖
+            cache_start = best_df.index[0]
+            cache_end = best_df.index[-1]
+            required_start = pd.to_datetime(start_date)
+            required_end = pd.to_datetime(end_date)
+            
+            if cache_start <= required_start and cache_end >= required_end:
+                # 完全覆盖，直接返回
+                logger.info(f"使用缓存文件完全覆盖: {os.path.basename(best_cache)}")
+                return best_df[required_start:required_end]
+        
+        # 3. 缓存未命中，从远程获取
+        logger.info(f"从远程获取5分钟数据: {stock_code} {start_date}至{end_date}")
+        df = self._fetch_5min_data_remote(stock_code, start_date, end_date, fields)
+        
+        if df is not None and not df.empty:
+            # 保存到本地缓存
+            self._save_to_local_cache(df, stock_code, start_date, end_date, "5m")
+            logger.info(f"5分钟数据获取完成: {stock_code}, 数据量: {len(df)}行")
+        else:
+            logger.warning(f"5分钟数据获取失败或为空: {stock_code}")
+        
+        return df
+    
+    def _fetch_5min_data_remote(self, stock_code: str, start_date: str, end_date: str, fields: str = STOCK_MIN_FIELDS) -> pd.DataFrame:
+        """远程获取5分钟数据"""
+        # fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
+        
+        try:
+            rs = bs.query_history_k_data_plus(
+                code=stock_code,
+                fields=fields,
+                start_date=start_date,
+                end_date=end_date,
+                frequency="5",
+                adjustflag="2"
+            )
+            
+            if rs.error_code != '0':
+                logger.error(f"获取5分钟数据失败 {stock_code}: {rs.error_msg}")
+                return pd.DataFrame()
+            
+            data_list = []
+            while rs.next():
+                data_list.append(rs.get_row_data())
+            
+            if not data_list:
+                logger.warning(f"5分钟数据为空: {stock_code}")
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df['time'] =pd.to_datetime(df['time'], format="%Y%m%d%H%M00000")
+            df.set_index('time', inplace=True)
+            
+            # "time,code,open,high,low,close,volume,amount"
+            numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg', 'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
+            for col in numeric_cols:
+                if col in df.columns:  # 先检查列是否存在
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            df = df[df['volume'] > 0]
+            df.sort_index(inplace=True)
+            
+            logger.debug(f"远程获取5分钟数据成功: {stock_code}, 数据量: {len(df)}行")
+            return df
+            
+        except Exception as e:
+            logger.error(f"远程获取5分钟数据异常 {stock_code}: {e}")
+            return pd.DataFrame()
+    
+    def get_daily_data_batch(self, stock_codes: List[str], start_date: str, end_date: str, fields: str = STOCK_DAY_FIELDS) -> Dict[str, pd.DataFrame]:
+        """批量获取多股票日线数据"""
+        logger.info(f"开始批量获取日线数据，股票数量: {len(stock_codes)}, 时间范围: {start_date}至{end_date}")
+        
+        results = {}
+        
+        for stock_code in stock_codes:
+            df = self.get_daily_data(stock_code, start_date, end_date, fields)
+            if not df.empty:
+                results[stock_code] = df
+                logger.debug(f"股票 {stock_code} 日线数据获取成功，数据量: {len(df)}行")
+            else:
+                logger.warning(f"股票 {stock_code} 日线数据获取失败或为空")
+
+        # def fetch_single(stock_code):
+        #     try:
+        #         df = self.get_daily_data(stock_code, start_date, end_date, fields)
+        #         return stock_code, df
+        #     except Exception as e:
+        #         logger.error(f"获取{stock_code}日线数据异常: {e}")
+        #         return stock_code, pd.DataFrame()
+        
+        # # 并发获取
+        # with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        #     future_to_code = {executor.submit(fetch_single, code): code for code in stock_codes}
+            
+        #     for future in as_completed(future_to_code):
+        #         code, df = future.result()
+        #         if not df.empty:
+        #             results[code] = df
+        #             logger.debug(f"股票 {code} 日线数据获取成功，数据量: {len(df)}行")
+        #         else:
+        #             logger.warning(f"股票 {code} 日线数据获取失败或为空")
+        
+        logger.info(f"批量获取日线数据完成，成功获取 {len(results)}/{len(stock_codes)} 只股票")
+        return results
+    
+    def get_5min_data_batch(self, stock_codes: List[str], start_date: str, end_date: str, fields: str = STOCK_MIN_FIELDS) -> Dict[str, pd.DataFrame]:
+        """批量获取多股票5分钟数据"""
+        logger.info(f"开始批量获取5分钟数据，股票数量: {len(stock_codes)}, 时间范围: {start_date}至{end_date}")
+        
+        results = {}
+
+        for stock_code in stock_codes:
+            df = self.get_5min_data(stock_code, start_date, end_date, fields)
+            if not df.empty:
+                results[stock_code] = df
+                logger.debug(f"股票 {stock_code} 日线数据获取成功，数据量: {len(df)}行")
+            else:
+                logger.warning(f"股票 {stock_code} 日线数据获取失败或为空")
+
+        # def fetch_single(stock_code):
+        #     try:
+        #         df = self.get_5min_data(stock_code, start_date, end_date, fields)
+        #         return stock_code, df
+        #     except Exception as e:
+        #         logger.error(f"获取{stock_code}5分钟数据异常: {e}")
+        #         return stock_code, pd.DataFrame()
+        
+        # # 并发获取
+        # with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        #     future_to_code = {executor.submit(fetch_single, code): code for code in stock_codes}
+            
+        #     for future in as_completed(future_to_code):
+        #         code, df = future.result()
+        #         if not df.empty:
+        #             results[code] = df
+        #             logger.debug(f"股票 {code} 5分钟数据获取成功，数据量: {len(df)}行")
+        #         else:
+        #             logger.warning(f"股票 {code} 5分钟数据获取失败或为空")
+        
+        logger.info(f"批量获取5分钟数据完成，成功获取 {len(results)}/{len(stock_codes)} 只股票")
+        return results
+    
+    def merge_multi_stock_data(self, stock_data_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        将多股票数据合并为时间序DataFrame
+        
+        返回格式:
+        datetime | stock_code | open | high | low | close | volume | ...
+        """
+        logger.info("开始合并多股票数据")
+        
+        merged_list = []
+        
+        for stock_code, df in stock_data_dict.items():
+            if df is not None and not df.empty:
+                df_copy = df.copy()
+                df_copy['stock_code'] = stock_code
+                merged_list.append(df_copy)
+                logger.debug(f"添加股票 {stock_code} 数据，数据量: {len(df)}行")
+            else:
+                logger.warning(f"股票 {stock_code} 数据为空，跳过")
+        
+        if not merged_list:
+            logger.warning("所有股票数据都为空，合并结果为空")
+            return pd.DataFrame()
+        
+        merged_df = pd.concat(merged_list)
+        merged_df.sort_index(inplace=True)
+        
+        logger.info(f"数据合并完成，总数据量: {len(merged_df)}行，股票数: {len(stock_data_dict)}")
+        return merged_df
+    
+    def prepare_warmup_data(self, stock_codes: List[str], warmup_days: int = 100, 
+                           end_date: str = '2021-01-01') -> Dict[str, pd.DataFrame]:
+        """准备预热数据用于初始化滚动计算器"""
+        # 计算开始日期，确保有足够的数据用于计算初始指标
+        warmup_end = pd.to_datetime(end_date) - timedelta(days=1)
+        warmup_start = warmup_end - timedelta(days=warmup_days * 2)
+        
+        warmup_start_str = warmup_start.strftime('%Y-%m-%d')
+        warmup_end_str = warmup_end.strftime('%Y-%m-%d')
+        
+        logger.info(f"准备预热数据，时间范围: {warmup_start_str} 至 {warmup_end_str}，股票数量: {len(stock_codes)}")
+        return self.get_daily_data_batch(stock_codes, warmup_start_str, warmup_end_str)
+    
+    def list_cached_files(self, stock_code: str = None, data_type: str = None):
+        """列出缓存文件"""
+        if not os.path.exists(self.cache_dir):
+            logger.warning(f"缓存目录不存在: {self.cache_dir}")
+            return
+        
+        files = os.listdir(self.cache_dir)
+        
+        if not files:
+            logger.info("缓存目录为空")
+            return
+        
+        logger.info(f"缓存目录: {self.cache_dir}")
+        logger.info(f"文件总数: {len(files)}")
+        logger.info("缓存文件列表:")
+        
+        for i, filename in enumerate(sorted(files)):
+            if filename.endswith('.csv'):
+                # 解析文件名
+                parts = filename.replace('.csv', '').split('_')
+                if len(parts) >= 4:
+                    file_stock = parts[0]
+                    file_start = parts[1]
+                    file_end = parts[2]
+                    file_type = parts[3]
+                    
+                    # 按条件过滤
+                    if stock_code and file_stock != stock_code:
+                        continue
+                    if data_type and file_type != data_type:
+                        continue
+                    
+                    # 显示文件信息
+                    filepath = os.path.join(self.cache_dir, filename)
+                    size_kb = os.path.getsize(filepath) / 1024
+                    
+                    # 读取文件头信息
+                    try:
+                        df = pd.read_csv(filepath, nrows=1)
+                        rows = sum(1 for line in open(filepath)) - 1  # 减掉标题行
+                        logger.info(f"{i+1:3d}. {filename} ({size_kb:.1f} KB, {rows} 行)")
+                        logger.info(f"     股票: {file_stock}, 类型: {file_type}")
+                        logger.info(f"     范围: {file_start} 至 {file_end}")
+                    except Exception as e:
+                        logger.warning(f"{i+1:3d}. {filename} ({size_kb:.1f} KB), 读取失败: {e}")
+
+
+if __name__ == "__main__":
+    
+    # 配置日志
+    logger = setup_logging(log_dir="./logs", log_level="INFO")
+    data_fetcher = DataFetcher(max_workers=5, cache_dir="./data_cache")
+    data_fetcher.login()
+    data_fetcher.get_daily_data_batch(
+        stock_codes=[
+                     'sh.601939',   # 建设银行
+                    #  'sh.600030', # 中信证券
+                    #  'sh.600036', # 招商银行
+                    #  'sh.600150', # 中国船舶
+                    #  'sh.000001', # 上证指数
+                    #  'sz.399001', # 深证成指
+                    #  'sz.399106', # 深证综指'
+                     ],
+        start_date='2010-01-01',
+        end_date='2026-01-29',
+        fields=DataFetcher.STOCK_DAY_FIELDS
+        # fields=DataFetcher.INDEX_DAY_FIELDS
+    )
+
+    data_fetcher.get_5min_data_batch(
+        stock_codes=[
+                     'sh.601939',   # 建设银行
+                     'sh.600036', # 招商银行
+                    #  'sh.600150', # 中国船舶
+                    # 'sh.000001', # 上证指数
+                    # 'sz.399001', # 深证成指
+                    #  'sz.399106', # 深证综指'
+                     ],
+        start_date='2010-01-01',
+        end_date='2026-01-29',
+        fields=DataFetcher.STOCK_MIN_FIELDS
+    )
+
+
+    data_fetcher.logout()
