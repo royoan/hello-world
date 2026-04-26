@@ -1,0 +1,256 @@
+"""
+多股票参数优化器
+"""
+
+import pandas as pd
+import numpy as np
+import itertools
+from typing import Dict, List, Tuple
+import logging
+from data_fetcher import DataFetcher
+from strategy import MACD_ATR_Strategy
+from multi_stock_backtest import MultiStockBacktestEngine
+
+# 获取模块logger
+logger = logging.getLogger(__name__)
+
+class MultiStockParameterOptimizer:
+    """多股票参数优化器"""
+    
+    def __init__(self, data_fetcher: DataFetcher, strategy: MACD_ATR_Strategy):
+        self.data_fetcher = data_fetcher
+        self.strategy = strategy
+        self.results = []
+        
+        logger.info("初始化多股票参数优化器")
+    
+    def optimize_parameters(self, stock_pool: List[str], start_date: str, end_date: str,
+                           param_grid: Dict, fixed_buy_amount: float = 50000.0,
+                           warmup_days: int = 100) -> Tuple[Tuple, pd.DataFrame]:
+        """
+        优化多股票策略参数
+        """
+        logger.info("=" * 60)
+        logger.info("开始多股票参数优化")
+        logger.info(f"股票池: {len(stock_pool)} 只股票")
+        logger.info(f"回测周期: {start_date} 至 {end_date}")
+        logger.info(f"单次买入金额: {fixed_buy_amount:.0f}元")
+        logger.info("=" * 60)
+        
+        # 1. 准备预热数据
+        logger.info("准备预热数据...")
+        warmup_end_date = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        warmup_data = self.data_fetcher.prepare_warmup_data(
+            stock_pool, warmup_days, warmup_end_date
+        )
+        
+        # 2. 获取回测数据
+        logger.info("获取回测数据...")
+        # daily_data = self.data_fetcher.get_daily_data_batch(stock_pool, start_date, end_date)
+        min_data = self.data_fetcher.get_5min_data_batch(stock_pool, start_date, end_date)
+        
+        # 合并5分钟数据
+        merged_min_data = self.data_fetcher.merge_multi_stock_data(min_data)
+        
+        if merged_min_data.empty:
+            logger.error("5分钟数据为空")
+            return None, pd.DataFrame()
+        
+        # 3. 划分训练集和测试集
+        split_idx = int(len(merged_min_data) * 0.7)
+        train_data = merged_min_data.iloc[:split_idx].copy()
+        test_data = merged_min_data.iloc[split_idx:].copy()
+        
+        logger.info(f"训练集: {len(train_data)} 条记录")
+        logger.debug(f"训练数据: \n{train_data.tail(20)}")
+        logger.info(f"测试集: {len(test_data)} 条记录")
+        logger.debug(f"测试数据: \n{test_data.tail(20)}")
+        
+        # 4. 参数网格搜索
+        param_combinations = list(itertools.product(
+            param_grid['fast_period'],
+            param_grid['slow_period'],
+            param_grid['signal_period'],
+            param_grid['profit_multiplier'],
+            param_grid['stop_loss_multiplier']
+        ))
+        
+        logger.info(f"参数组合总数: {len(param_combinations)}")
+        
+        optimization_results = []
+        best_score = -float('inf')
+        best_params = None
+        
+        for i, (fast, slow, signal, profit_mult, stop_mult) in enumerate(param_combinations, 1):
+            if slow <= fast:
+                logger.debug(f"跳过无效参数组合: 慢线({slow}) <= 快线({fast})")
+                continue
+            
+            try:
+                # 创建回测引擎
+                backtest_engine = MultiStockBacktestEngine(
+                    initial_capital=100000.0,
+                    fixed_buy_amount=fixed_buy_amount,
+                    high_price_limit=500.0,
+                    max_single_position_pct=0.1
+                )
+                backtest_engine.set_transaction_cost_func(self.strategy.calculate_transaction_cost)
+                
+                # 初始化计算器
+                backtest_engine.initialize_calculators(
+                    warmup_data, fast, slow, signal
+                )
+                
+                # 在训练集上回测
+                logger.info(f"==> 开始测试参数组合 {i}/{len(param_combinations)}: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
+                logger.debug(f"训练数据: {warmup_data}")
+                results = backtest_engine.run_backtest(
+                    train_data,
+                    profit_multiplier=profit_mult,
+                    stop_loss_multiplier=stop_mult
+                )
+                
+                # 计算综合评分（考虑收益率、回撤、夏普比率）
+                score = (
+                    results['annual_return'] * 0.4 +
+                    (1 - abs(results['max_drawdown'])) * 0.3 +
+                    results['sharpe_ratio'] * 0.3
+                )
+                
+                optimization_results.append({
+                    'fast_period': fast,
+                    'slow_period': slow,
+                    'signal_period': signal,
+                    'profit_multiplier': profit_mult,
+                    'stop_loss_multiplier': stop_mult,
+                    'total_return': results['total_return'],
+                    'annual_return': results['annual_return'],
+                    'max_drawdown': results['max_drawdown'],
+                    'sharpe_ratio': results['sharpe_ratio'],
+                    'win_rate': results['win_rate'],
+                    'trade_count': results['trade_count'],
+                    'avg_position_count': results['avg_position_count'],
+                    'score': score
+                })
+                logger.info(f"<== 结束测试参数组合 {i}/{len(param_combinations)}: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
+                logger.info(f"当前参数组合结果: {optimization_results[-1]}")
+                # 更新最佳参数
+                if score > best_score:
+                    best_score = score
+                    best_params = (fast, slow, signal, profit_mult, stop_mult)
+                    logger.info(f"发现新的最佳参数: {best_params}，得分: {score:.4f}")
+                
+                if i % 5 == 0 or i == 1 or i == len(param_combinations):
+                    logger.info(f"进度: {i}/{len(param_combinations)} | "
+                                f"当前最佳: {best_params} | 得分: {best_score:.4f}")
+                    
+            except Exception as e:
+                logger.error(f"参数组合 {fast},{slow},{signal},{profit_mult},{stop_mult} 回测失败: {str(e)[:50]}")
+                continue
+        
+        # 5. 整理结果
+        results_df = pd.DataFrame(optimization_results)
+        if not results_df.empty:
+            results_df = results_df.sort_values('score', ascending=False).reset_index(drop=True)
+            logger.info(f"参数优化完成，有效组合数: {len(results_df)}")
+        else:
+            logger.warning("没有有效的参数组合结果")
+        
+        return best_params, results_df
+    
+    def validate_parameters(self, stock_pool: List[str], start_date: str, end_date: str,
+                           params: Tuple, fixed_buy_amount: float = 50000.0,
+                           warmup_days: int = 100) -> Dict:
+        """
+        在测试集上验证参数
+        """
+        fast, slow, signal, profit_mult, stop_mult = params
+        
+        logger.info(f"开始参数验证: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
+        
+        # 准备数据
+        warmup_end_date = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        warmup_data = self.data_fetcher.prepare_warmup_data(
+            stock_pool, warmup_days, warmup_end_date
+        )
+        
+        min_data = self.data_fetcher.get_5min_data_batch(stock_pool, start_date, end_date)
+        merged_min_data = self.data_fetcher.merge_multi_stock_data(min_data)
+        
+        if merged_min_data.empty:
+            logger.error("验证数据为空")
+            return {}
+        
+        # 划分测试集（后30%）
+        split_idx = int(len(merged_min_data) * 0.7)
+        test_data = merged_min_data.iloc[split_idx:].copy()
+        
+        logger.info(f"验证数据集: {len(test_data)} 条记录")
+        
+        # 创建回测引擎
+        backtest_engine = MultiStockBacktestEngine(
+            initial_capital=1000000.0,
+            fixed_buy_amount=fixed_buy_amount,
+            high_price_limit=500.0
+        )
+        backtest_engine.set_transaction_cost_func(self.strategy.calculate_transaction_cost)
+        
+        # 初始化计算器
+        backtest_engine.initialize_calculators(warmup_data, fast, slow, signal)
+        
+        # 执行回测
+        results = backtest_engine.run_backtest(
+            test_data,
+            profit_multiplier=profit_mult,
+            stop_loss_multiplier=stop_mult
+        )
+        
+        logger.info(f"参数验证完成，最终权益: {results.get('final_equity', 0):,.2f}元")
+        
+        return results
+    
+    def run_full_backtest(self, stock_pool: List[str], start_date: str, end_date: str,
+                         params: Tuple, fixed_buy_amount: float = 50000.0,
+                         warmup_days: int = 100) -> Tuple[Dict, pd.DataFrame]:
+        """
+        在整个周期上运行完整回测
+        """
+        fast, slow, signal, profit_mult, stop_mult = params
+        
+        logger.info(f"执行完整回测，参数: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
+        
+        # 准备数据
+        warmup_end_date = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        warmup_data = self.data_fetcher.prepare_warmup_data(
+            stock_pool, warmup_days, warmup_end_date
+        )
+        
+        min_data = self.data_fetcher.get_5min_data_batch(stock_pool, start_date, end_date)
+        merged_min_data = self.data_fetcher.merge_multi_stock_data(min_data)
+        
+        logger.info(f"完整回测数据准备完成，数据量: {len(merged_min_data)} 条记录")
+        
+        # 创建回测引擎
+        backtest_engine = MultiStockBacktestEngine(
+            initial_capital=1000000.0,
+            fixed_buy_amount=fixed_buy_amount,
+            high_price_limit=500.0
+        )
+        backtest_engine.set_transaction_cost_func(self.strategy.calculate_transaction_cost)
+        
+        # 初始化计算器
+        backtest_engine.initialize_calculators(warmup_data, fast, slow, signal)
+        
+        # 执行回测
+        results = backtest_engine.run_backtest(
+            merged_min_data,
+            profit_multiplier=profit_mult,
+            stop_loss_multiplier=stop_mult
+        )
+        
+        # 生成股票分析
+        stock_analysis = backtest_engine.generate_stock_analysis()
+        
+        logger.info(f"完整回测完成，最终权益: {results.get('final_equity', 0):,.2f}元")
+        
+        return results, stock_analysis
