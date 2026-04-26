@@ -1,0 +1,388 @@
+"""
+滚动日线指标计算器
+在每个时间点上，仅使用截至当前的历史数据计算日线级MACD与ATR，彻底避免未来函数。
+用于多股票回测系统中的实时指标计算。
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional
+import logging
+
+# 获取模块logger
+logger = logging.getLogger(__name__)
+
+class RollingDailyCalculator:
+    """
+    实时滚动计算日线指标（MACD, ATR）
+    
+    设计原理：
+    1. 在每个5分钟K线到来时，更新当日累计数据
+    2. 使用历史日线 + 当日累计数据计算实时指标
+    3. 当日结束时，将累计数据固化为正式日线
+    4. 避免使用未来数据，完全符合实际交易场景
+    
+    输入：5分钟K线流
+    输出：每个5分钟点对应的实时日线指标
+    """
+
+    def __init__(self, historical_daily_df: pd.DataFrame, 
+                 fast_period: int = 12, slow_period: int = 26, 
+                 signal_period: int = 9, atr_period: int = 14):
+        """
+        初始化滚动计算器
+        
+        参数:
+            historical_daily_df: 初始化用的历史日线数据
+                                必须包含列: ['open', 'high', 'low', 'close', 'volume']
+            fast_period: MACD快线周期，默认12
+            slow_period: MACD慢线周期，默认26
+            signal_period: MACD信号线周期，默认9
+            atr_period: ATR计算周期，默认14
+        """
+        # 存储策略参数
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+        self.signal_period = signal_period
+        self.atr_period = atr_period
+        
+        logger.info(f"初始化滚动计算器，参数: 快线={fast_period}, 慢线={slow_period}, 信号线={signal_period}, ATR周期={atr_period}")
+        
+        # 初始化历史日线数据（用于指标计算的历史基准）
+        self._initialize_historical_data(historical_daily_df)
+        
+        # 当日累计数据（用于构建"实时日线"）
+        self.current_date = None
+        self.current_day_bars: List[Dict] = []  # 存储当日所有5分钟K线
+        
+        # 指标计算缓存
+        self._daily_series_cache = None
+        self._last_calc_time = None
+        
+    def _initialize_historical_data(self, daily_df: pd.DataFrame):
+        """初始化历史日线数据存储结构"""
+        self.historical_daily_records = []
+        
+        if daily_df is not None and not daily_df.empty:
+            # 确保数据按日期排序
+            daily_df = daily_df.sort_index()
+            
+            # 转换格式为内部记录格式
+            for date_idx, row in daily_df.iterrows():
+                record = {
+                    'date': pd.Timestamp(date_idx),
+                    'open': float(row['open']),
+                    'high': float(row['high']),
+                    'low': float(row['low']),
+                    'close': float(row['close']),
+                    'volume': float(row.get('volume', 0))
+                }
+                self.historical_daily_records.append(record)
+            
+            logger.info(f"加载历史日线数据 {len(self.historical_daily_records)} 条记录")
+        
+        # 确保有足够的历史数据用于计算
+        self._ensure_sufficient_history()
+    
+    def _ensure_sufficient_history(self):
+        """确保有足够的历史数据用于指标计算"""
+        min_required = max(self.slow_period, self.atr_period) + self.signal_period + 10
+        if len(self.historical_daily_records) < min_required:
+            logger.warning(f"历史数据不足，建议至少提供{min_required}个交易日数据，当前: {len(self.historical_daily_records)}")
+        else:
+            logger.info(f"历史数据充足，当前: {len(self.historical_daily_records)}条，所需最少: {min_required}条")
+    
+    def update(self, bar_datetime: pd.Timestamp, open_price: float, 
+               high_price: float, low_price: float, close_price: float, 
+               volume: float = 0) -> Dict[str, float]:
+        """
+        接收一根新的5分钟K线，更新滚动状态，并计算当前时刻的指标
+        
+        参数:
+            bar_datetime: 5分钟K线的时间戳
+            open_price: 开盘价
+            high_price: 最高价
+            low_price: 最低价
+            close_price: 收盘价
+            volume: 成交量（可选）
+            
+        返回:
+            包含实时指标的字典:
+            - 'dif': 实时DIF值
+            - 'dea': 实时DEA值
+            - 'macd_hist': 实时MACD柱状值
+            - 'atr': 实时ATR值
+            - 'signal': 交易信号 (1:金叉买入, -1:死叉卖出, 0:无信号)
+            - 'daily_close_est': 当前估算的日收盘价
+        """
+        current_date = bar_datetime.date()
+        
+        # --- 数据管理：检查交易日切换 ---
+        if current_date != self.current_date:
+            # 新交易日开始：固化前一日数据，重置当日缓存
+            logger.debug(f"交易日切换: {self.current_date} -> {current_date}")
+            self._finalize_previous_day()
+            self.current_date = current_date
+            self.current_day_bars = []
+            self._daily_series_cache = None  # 清除缓存
+        
+        # --- 数据管理：更新当日累计数据 ---
+        current_bar = {
+            'datetime': bar_datetime,
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price,
+            'volume': volume
+        }
+        self.current_day_bars.append(current_bar)
+        self._daily_series_cache = None  # 数据更新，清除缓存
+        
+        logger.debug(f"更新5分钟K线: {bar_datetime}, 收盘价: {close_price}, 当日累计K线数: {len(self.current_day_bars)}")
+        
+        # --- 指标计算：获取实时指标 ---
+        return self._calculate_realtime_indicators()
+    
+    def _finalize_previous_day(self):
+        """将前一天的累计数据转换为正式日线并加入历史记录"""
+        if self.current_date is None or not self.current_day_bars:
+            logger.debug("没有需要固化的数据")
+            return  # 没有需要固化的数据
+        
+        # 从5分钟数据聚合出日线OHLCV
+        if self.current_day_bars:
+            opens = [bar['open'] for bar in self.current_day_bars]
+            highs = [bar['high'] for bar in self.current_day_bars]
+            lows = [bar['low'] for bar in self.current_day_bars]
+            closes = [bar['close'] for bar in self.current_day_bars]
+            volumes = [bar['volume'] for bar in self.current_day_bars]
+            
+            daily_bar = {
+                'date': pd.Timestamp(self.current_date),
+                'open': opens[0],           # 日开盘价：当日第一根5分钟线的开盘价
+                'high': max(highs),         # 日最高价：当日所有5分钟线的最高价
+                'low': min(lows),           # 日最低价：当日所有5分钟线的最低价
+                'close': closes[-1],        # 日收盘价：当日最后一根5分钟线的收盘价
+                'volume': sum(volumes)      # 日成交量：当日所有5分钟线的成交量之和
+            }
+            
+            # 添加到历史记录
+            self.historical_daily_records.append(daily_bar)
+            
+            logger.debug(f"固化交易日数据: {self.current_date}, 开盘: {opens[0]}, 收盘: {closes[-1]}, 高低: [{min(lows)}, {max(highs)}]")
+            
+            # 保持历史数据大小（可选：限制最大历史记录数）
+            max_history = 1000
+            if len(self.historical_daily_records) > max_history:
+                removed = len(self.historical_daily_records) - max_history
+                self.historical_daily_records = self.historical_daily_records[-max_history:]
+                logger.debug(f"清理历史数据，移除 {removed} 条旧记录")
+    
+    def _build_daily_series_for_calculation(self) -> pd.DataFrame:
+        """
+        构建用于指标计算的日线序列
+        包含：历史日线 + 当日累计数据（虚拟日线）
+        """
+        # 使用缓存提高性能
+        if self._daily_series_cache is not None:
+            return self._daily_series_cache
+        
+        # 复制历史记录
+        daily_bars = self.historical_daily_records.copy()
+        
+        # 如果当日有数据，构建一条"虚拟日线"追加到末尾
+        if self.current_day_bars:
+            opens = [bar['open'] for bar in self.current_day_bars]
+            highs = [bar['high'] for bar in self.current_day_bars]
+            lows = [bar['low'] for bar in self.current_day_bars]
+            closes = [bar['close'] for bar in self.current_day_bars]
+            volumes = [bar['volume'] for bar in self.current_day_bars]
+            
+            virtual_daily_bar = {
+                'date': pd.Timestamp(self.current_date),
+                'open': opens[0],
+                'high': max(highs),
+                'low': min(lows),
+                'close': closes[-1],
+                'volume': sum(volumes)
+            }
+            daily_bars.append(virtual_daily_bar)
+        
+        # 转换为DataFrame
+        if not daily_bars:
+            df = pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+            logger.warning("用于计算的日线序列为空")
+        else:
+            df = pd.DataFrame(daily_bars)
+            df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)  # 确保按日期排序
+            
+            logger.debug(f"构建日线序列完成，总记录数: {len(df)}")
+        
+        # 缓存结果
+        self._daily_series_cache = df
+        return df
+    
+    def _calculate_realtime_indicators(self) -> Dict[str, float]:
+        """计算实时指标（MACD和ATR）"""
+        # 获取用于计算的日线序列
+        daily_series = self._build_daily_series_for_calculation()
+        
+        if len(daily_series) < max(self.slow_period, self.atr_period):
+            # 数据不足，返回默认值
+            logger.warning(f"数据不足，无法计算指标。当前数据: {len(daily_series)}条，所需最少: {max(self.slow_period, self.atr_period)}条")
+            return self._get_default_indicators()
+        
+        # 计算MACD指标
+        macd_results = self._calculate_macd_series(daily_series)
+        
+        # 计算ATR指标
+        atr_value = self._calculate_atr_value(daily_series)
+        
+        # 生成交易信号
+        signal = self._detect_trading_signal(macd_results)
+        
+        # 获取最新值
+        latest_values = self._get_latest_values(macd_results)
+        
+        # 返回指标字典
+        result = {
+            'dif': latest_values.get('dif', 0),
+            'dea': latest_values.get('dea', 0),
+            'macd_hist': latest_values.get('macd_hist', 0),
+            'atr': atr_value,
+            'signal': signal,
+            'daily_close_est': daily_series['close'].iloc[-1] if not daily_series.empty else 0
+        }
+        
+        logger.debug(f"实时指标计算完成: DIF={result['dif']:.4f}, DEA={result['dea']:.4f}, ATR={result['atr']:.4f}, 信号={signal}")
+        
+        return result
+    
+    def _get_default_indicators(self) -> Dict[str, float]:
+        """返回默认指标值（数据不足时使用）"""
+        logger.debug("返回默认指标值")
+        return {
+            'dif': 0.0,
+            'dea': 0.0,
+            'macd_hist': 0.0,
+            'atr': 0.0,
+            'signal': 0,
+            'daily_close_est': 0.0
+        }
+    
+    def _calculate_macd_series(self, daily_series: pd.DataFrame) -> pd.DataFrame:
+        """计算MACD指标序列（DIF, DEA, MACD柱）"""
+        df = daily_series.copy()
+        
+        # 确保有足够的数据
+        if len(df) < self.slow_period + self.signal_period:
+            logger.warning(f"MACD计算数据不足，当前: {len(df)}条，所需最少: {self.slow_period + self.signal_period}条")
+            return pd.DataFrame(columns=['dif', 'dea', 'macd_hist'])
+        
+        # 计算EMA（指数移动平均）
+        df['ema_fast'] = df['close'].ewm(span=self.fast_period, adjust=False).mean()
+        df['ema_slow'] = df['close'].ewm(span=self.slow_period, adjust=False).mean()
+        
+        # 计算DIF（差离值）
+        df['dif'] = df['ema_fast'] - df['ema_slow']
+        
+        # 计算DEA（信号线，即DIF的EMA）
+        df['dea'] = df['dif'].ewm(span=self.signal_period, adjust=False).mean()
+        
+        # 计算MACD柱状图
+        df['macd_hist'] = df['dif'] - df['dea']
+        
+        logger.debug(f"MACD序列计算完成，数据量: {len(df)}行")
+        # 返回MACD相关列
+        return df[['dif', 'dea', 'macd_hist']].copy()
+    
+    def _calculate_atr_value(self, daily_series: pd.DataFrame) -> float:
+        """计算ATR（平均真实波幅）指标的最新值"""
+        if len(daily_series) < self.atr_period + 1:
+            logger.warning(f"ATR计算数据不足，当前: {len(daily_series)}条，所需最少: {self.atr_period + 1}条")
+            return 0.0
+        
+        df = daily_series.copy()
+        
+        # 计算真实波幅（True Range, TR）
+        # TR = max(当日最高-最低, abs(当日最高-前日收盘), abs(当日最低-前日收盘))
+        high_low = df['high'] - df['low']
+        high_close_prev = abs(df['high'] - df['close'].shift(1))
+        low_close_prev = abs(df['low'] - df['close'].shift(1))
+        
+        tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+        
+        # 计算ATR（TR的简单移动平均）
+        atr_series = tr.rolling(window=self.atr_period).mean()
+        
+        # 返回最新的ATR值
+        atr_value = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else 0.0
+        logger.debug(f"ATR值计算完成: {atr_value:.4f}")
+        
+        return atr_value
+    
+    def _detect_trading_signal(self, macd_series: pd.DataFrame) -> int:
+        """检测交易信号：金叉（买入）或死叉（卖出）"""
+        if len(macd_series) < 2:
+            logger.debug("MACD数据不足，无法检测信号")
+            return 0
+        
+        # 获取最新两个数据点
+        latest = macd_series.iloc[-1]
+        previous = macd_series.iloc[-2]
+        
+        # 检测金叉：DIF上穿DEA
+        # 条件：前一时刻DIF<=DEA，当前时刻DIF>DEA
+        if previous['dif'] <= previous['dea'] and latest['dif'] > latest['dea']:
+            logger.debug(f"检测到金叉信号: DIF({latest['dif']:.4f}) > DEA({latest['dea']:.4f})")
+            return 1  # 买入信号
+        
+        # 检测死叉：DIF下穿DEA
+        # 条件：前一时刻DIF>=DEA，当前时刻DIF<DEA
+        elif previous['dif'] >= previous['dea'] and latest['dif'] < latest['dea']:
+            logger.debug(f"检测到死叉信号: DIF({latest['dif']:.4f}) < DEA({latest['dea']:.4f})")
+            return -1  # 卖出信号
+        
+        logger.debug(f"无交易信号: DIF={latest['dif']:.4f}, DEA={latest['dea']:.4f}")
+        return 0  # 无信号
+    
+    def _get_latest_values(self, macd_series: pd.DataFrame) -> Dict[str, float]:
+        """获取MACD指标的最新值"""
+        if macd_series.empty:
+            logger.debug("MACD序列为空")
+            return {'dif': 0.0, 'dea': 0.0, 'macd_hist': 0.0}
+        
+        latest = macd_series.iloc[-1]
+        return {
+            'dif': float(latest['dif']),
+            'dea': float(latest['dea']),
+            'macd_hist': float(latest['macd_hist'])
+        }
+    
+    def get_current_status(self) -> Dict:
+        """获取当前计算器状态（用于调试）"""
+        status = {
+            'historical_record_count': len(self.historical_daily_records),
+            'current_day_bar_count': len(self.current_day_bars),
+            'current_date': str(self.current_date),
+            'parameters': {
+                'fast_period': self.fast_period,
+                'slow_period': self.slow_period,
+                'signal_period': self.signal_period,
+                'atr_period': self.atr_period
+            }
+        }
+        
+        logger.debug(f"计算器状态: {status}")
+        return status
+    
+    def reset(self, historical_daily_df: pd.DataFrame = None):
+        """重置计算器状态"""
+        logger.info("重置滚动计算器")
+        if historical_daily_df is not None:
+            self._initialize_historical_data(historical_daily_df)
+        
+        self.current_date = None
+        self.current_day_bars = []
+        self._daily_series_cache = None
