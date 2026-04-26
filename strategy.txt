@@ -1,0 +1,103 @@
+"""
+核心策略模块
+"""
+
+import pandas as pd
+import numpy as np
+import logging
+
+# 获取模块logger
+logger = logging.getLogger(__name__)
+
+class MACD_ATR_Strategy:
+    """MACD+ATR策略核心类"""
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """
+        计算ATR（平均真实波幅）指标
+        
+        参数:
+            df: 包含OHLC数据的DataFrame
+            period: ATR计算周期，默认为14
+            
+        返回:
+            添加了ATR列的DataFrame
+        """
+        logger.debug(f"开始计算ATR指标，周期: {period}")
+        
+        df = df.copy()
+        
+        # 计算真实波幅TR
+        high_low = df['high'] - df['low']
+        high_close = abs(df['high'] - df['close'].shift())
+        low_close = abs(df['low'] - df['close'].shift())
+        
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        
+        # 计算ATR（使用SMA）
+        df['ATR'] = tr.rolling(window=period).mean()
+        
+        logger.debug(f"ATR计算完成，数据量: {len(df)}行")
+        return df
+    
+    def calculate_macd(self, df: pd.DataFrame, fast_period: int = 12, 
+                      slow_period: int = 26, signal_period: int = 9) -> pd.DataFrame:
+        """
+        计算MACD指标
+        
+        参数:
+            df: 包含收盘价数据的DataFrame
+            fast_period: 快线周期，默认12
+            slow_period: 慢线周期，默认26
+            signal_period: 信号线周期，默认9
+            
+        返回:
+            添加了MACD相关列的DataFrame
+        """
+        logger.debug(f"开始计算MACD指标，快线: {fast_period}, 慢线: {slow_period}, 信号线: {signal_period}")
+        
+        df = df.copy()
+        
+        # 计算EMA
+        df['EMA_fast'] = df['close'].ewm(span=fast_period, adjust=False).mean()
+        df['EMA_slow'] = df['close'].ewm(span=slow_period, adjust=False).mean()
+        
+        # 计算DIF（差离值）
+        df['DIF'] = df['EMA_fast'] - df['EMA_slow']
+        
+        # 计算DEA（信号线）
+        df['DEA'] = df['DIF'].ewm(span=signal_period, adjust=False).mean()
+        
+        # 计算MACD柱
+        df['MACD_hist'] = df['DIF'] - df['DEA']
+        
+        logger.debug(f"MACD计算完成，数据量: {len(df)}行")
+        return df
+    
+    def calculate_transaction_cost(self, trade_amount: float, is_buy: bool = True) -> float:
+        """
+        计算交易成本
+        
+        参数:
+            trade_amount: 交易金额（元）
+            is_buy: 是否为买入交易
+            
+        返回:
+            交易成本（元）
+        """
+        # 买入佣金：0.01%，最低5元
+        if is_buy:
+            commission = max(trade_amount * 0.0001, 5)
+            logger.debug(f"计算买入交易成本，金额: {trade_amount:.2f}元，成本: {commission:.2f}元")
+            return commission
+        
+        # 卖出成本：佣金 + 印花税
+        else:
+            # 卖出佣金：0.01%，最低5元
+            commission = max(trade_amount * 0.0001, 5)
+            # 卖出印花税：千分之三
+            stamp_duty = trade_amount * 0.003
+            total_cost = commission + stamp_duty
+            
+            logger.debug(f"计算卖出交易成本，金额: {trade_amount:.2f}元，佣金: {commission:.2f}元，印花税: {stamp_duty:.2f}元，总成本: {total_cost:.2f}元")
+            return total_cost
