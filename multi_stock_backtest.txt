@@ -1,256 +1,536 @@
 """
-多股票参数优化器
+多股票回测引擎
+支持股票池轮动、固定金额买入、高价股限购策略
 """
 
 import pandas as pd
 import numpy as np
-import itertools
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from datetime import date
 import logging
-from data_fetcher import DataFetcher
-from strategy import MACD_ATR_Strategy
-from multi_stock_backtest import MultiStockBacktestEngine
+from rolling_daily_calculator import RollingDailyCalculator
 
 # 获取模块logger
 logger = logging.getLogger(__name__)
 
-class MultiStockParameterOptimizer:
-    """多股票参数优化器"""
+class PositionRecord:
+    """单只股票持仓记录"""
     
-    def __init__(self, data_fetcher: DataFetcher, strategy: MACD_ATR_Strategy):
-        self.data_fetcher = data_fetcher
-        self.strategy = strategy
-        self.results = []
+    def __init__(self, stock_code: str, entry_date: date, entry_price: float, 
+                 shares: int, entry_daily_close: float, entry_atr: float):
+        self.stock_code = stock_code
+        self.entry_date = entry_date
+        self.entry_price = entry_price  # 实际买入价格
+        self.shares = shares
+        self.entry_daily_close = entry_daily_close  # 用于计算风控的日线收盘价
+        self.entry_atr = entry_atr
+        self.current_value = 0.0
         
-        logger.info("初始化多股票参数优化器")
+        logger.debug(f"创建持仓记录: {stock_code}, 买入价: {entry_price}, 股数: {shares}, 日收盘价: {entry_daily_close}, ATR: {entry_atr}")
+        
+    def update_value(self, current_price: float):
+        """更新当前市值"""
+        old_value = self.current_value
+        self.current_value = self.shares * current_price
+        logger.debug(f"更新持仓市值: {self.stock_code}, 价格: {current_price}, 市值: {old_value:.2f} -> {self.current_value:.2f}")
+        
+    def calculate_pnl(self, current_price: float) -> Tuple[float, float]:
+        """计算盈亏金额和百分比"""
+        pnl_amount = (current_price - self.entry_price) * self.shares
+        pnl_pct = (current_price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0
+        logger.debug(f"计算盈亏: {self.stock_code}, 当前价: {current_price:.2f}, 盈亏金额: {pnl_amount:.2f}, 盈亏比例: {pnl_pct:.2%}")
+        return pnl_amount, pnl_pct
     
-    def optimize_parameters(self, stock_pool: List[str], start_date: str, end_date: str,
-                           param_grid: Dict, fixed_buy_amount: float = 50000.0,
-                           warmup_days: int = 100) -> Tuple[Tuple, pd.DataFrame]:
+    def check_profit_target(self, current_price: float, profit_multiplier: float) -> bool:
+        """检查是否达到止盈目标"""
+        profit_target = self.entry_daily_close + (self.entry_atr * profit_multiplier)
+        is_target_reached = current_price >= profit_target
+        if is_target_reached:
+            logger.info(f"达到止盈目标: {self.stock_code}, 当前价: {current_price:.2f}, 目标价: {profit_target:.2f}")
+        return is_target_reached
+    
+    def check_stop_loss(self, current_price: float, stop_loss_multiplier: float) -> bool:
+        """检查是否达到止损目标"""
+        stop_loss_target = self.entry_daily_close - (self.entry_atr * stop_loss_multiplier)
+        is_stop_reached = current_price <= stop_loss_target
+        if is_stop_reached:
+            logger.info(f"达到止损目标: {self.stock_code}, 当前价: {current_price:.2f}, 止损价: {stop_loss_target:.2f}")
+        return is_stop_reached
+
+class MultiStockBacktestEngine:
+    """多股票回测引擎"""
+    
+    def __init__(self, initial_capital: float = 1000000.0, 
+                 fixed_buy_amount: float = 50000.0,
+                 max_single_position_pct: float = 0.1,  # 单只股票最大仓位比例
+                 high_price_limit: float = 500.0):  # 高价股限购价格
+        self.initial_capital = initial_capital
+        self.fixed_buy_amount = fixed_buy_amount
+        self.max_single_position_pct = max_single_position_pct
+        self.high_price_limit = high_price_limit
+        
+        self.transaction_cost_func = None
+        self.cash = initial_capital
+        self.positions: Dict[str, PositionRecord] = {}  # 股票代码 -> 持仓记录
+        self.calculators: Dict[str, RollingDailyCalculator] = {}  # 股票代码 -> 滚动计算器
+        
+        # 绩效记录
+        self.trade_records = []
+        self.equity_curve = [initial_capital]
+        self.equity_dates = []
+        self.daily_positions = []  # 每日持仓快照
+        
+        logger.info(f"初始化回测引擎，初始资金: {initial_capital:,.2f}元，固定买入金额: {fixed_buy_amount:,.2f}元，高价股限价: {high_price_limit}元")
+        
+    def set_transaction_cost_func(self, cost_func):
+        """设置交易成本计算函数"""
+        self.transaction_cost_func = cost_func
+        logger.debug("设置交易成本计算函数")
+    
+    def initialize_calculators(self, warmup_data: Dict[str, pd.DataFrame], 
+                              fast_period: int, slow_period: int, signal_period: int):
+        """初始化所有股票的滚动计算器"""
+        logger.info(f"初始化滚动计算器，参数: 快线={fast_period}, 慢线={slow_period}, 信号线={signal_period}")
+        
+        calculator_count = 0
+        for stock_code, daily_df in warmup_data.items():
+            if not daily_df.empty:
+                self.calculators[stock_code] = RollingDailyCalculator(
+                    historical_daily_df=daily_df,
+                    fast_period=fast_period,
+                    slow_period=slow_period,
+                    signal_period=signal_period,
+                    atr_period=14
+                )
+                calculator_count += 1
+                logger.debug(f"为股票 {stock_code} 创建计算器，历史数据: {len(daily_df)}条")
+            else:
+                logger.warning(f"股票 {stock_code} 的预热数据为空，跳过计算器初始化")
+        
+        logger.info(f"滚动计算器初始化完成，共初始化 {calculator_count} 个计算器")
+    
+    def calculate_shares_to_buy(self, stock_code: str, current_price: float, 
+                               available_cash: float) -> Tuple[int, float]:
         """
-        优化多股票策略参数
+        计算应买入股数
+        规则：
+        1. 股价超过high_price_limit时，只买100股
+        2. 否则按fixed_buy_amount计算，但调整为100股的整数倍
+        3. 考虑可用资金限制
         """
-        logger.info("=" * 60)
-        logger.info("开始多股票参数优化")
-        logger.info(f"股票池: {len(stock_pool)} 只股票")
-        logger.info(f"回测周期: {start_date} 至 {end_date}")
-        logger.info(f"单次买入金额: {fixed_buy_amount:.0f}元")
-        logger.info("=" * 60)
+        if current_price <= 0:
+            logger.warning(f"股票 {stock_code} 当前价格无效: {current_price}")
+            return 0, 0
         
-        # 1. 准备预热数据
-        logger.info("准备预热数据...")
-        warmup_end_date = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-        warmup_data = self.data_fetcher.prepare_warmup_data(
-            stock_pool, warmup_days, warmup_end_date
-        )
+        # 高价股限购
+        if current_price > self.high_price_limit:
+            shares = 100  # 只买一手
+            logger.debug(f"高价股限购: {stock_code} 价格 {current_price} > {self.high_price_limit}，只买1手(100股)")
+        else:
+            # 按固定金额计算
+            target_shares = int(self.fixed_buy_amount // current_price)
+            # 调整为100股的整数倍
+            shares = (target_shares // 100) * 100
+            # 至少买100股
+            shares = max(shares, 100)
+            
+            logger.debug(f"常规买入计算: {stock_code}，目标金额 {self.fixed_buy_amount}，价格 {current_price}，理论股数 {target_shares}，调整后 {shares}股")
         
-        # 2. 获取回测数据
-        logger.info("获取回测数据...")
-        # daily_data = self.data_fetcher.get_daily_data_batch(stock_pool, start_date, end_date)
-        min_data = self.data_fetcher.get_5min_data_batch(stock_pool, start_date, end_date)
+        # 检查资金是否足够
+        cost = shares * current_price
+        transaction_cost = self.transaction_cost_func(cost, is_buy=True)
+        total_cost = cost + transaction_cost
         
-        # 合并5分钟数据
-        merged_min_data = self.data_fetcher.merge_multi_stock_data(min_data)
+        if total_cost > available_cash:
+            # 资金不足，减少股数
+            logger.debug(f"资金不足，可用资金: {available_cash:.2f}，所需资金: {total_cost:.2f}")
+            max_affordable_shares = int((available_cash - transaction_cost) // current_price)
+            shares = (max_affordable_shares // 100) * 100
+            shares = max(shares, 0)  # 可能为0
         
-        if merged_min_data.empty:
-            logger.error("5分钟数据为空")
-            return None, pd.DataFrame()
+        # 重新计算实际成本
+        actual_cost = shares * current_price
+        logger.debug(f"最终买入计算: {stock_code}，买入股数: {shares}，成本: {actual_cost:.2f}元")
         
-        # 3. 划分训练集和测试集
-        split_idx = int(len(merged_min_data) * 0.7)
-        train_data = merged_min_data.iloc[:split_idx].copy()
-        test_data = merged_min_data.iloc[split_idx:].copy()
+        return shares, actual_cost
+    
+    def run_backtest(self, merged_5min_data: pd.DataFrame,
+                    profit_multiplier: float = 1.0,
+                    stop_loss_multiplier: float = 1.0) -> Dict:
+        """
+        执行多股票回测
         
-        logger.info(f"训练集: {len(train_data)} 条记录")
-        logger.debug(f"训练数据: \n{train_data.tail(20)}")
-        logger.info(f"测试集: {len(test_data)} 条记录")
-        logger.debug(f"测试数据: \n{test_data.tail(20)}")
+        参数:
+            merged_5min_data: 合并的多股票5分钟数据，必须包含'stock_code'列
+        """
+        if self.transaction_cost_func is None:
+            logger.error("未设置交易成本计算函数")
+            raise ValueError("未设置交易成本计算函数")
         
-        # 4. 参数网格搜索
-        param_combinations = list(itertools.product(
-            param_grid['fast_period'],
-            param_grid['slow_period'],
-            param_grid['signal_period'],
-            param_grid['profit_multiplier'],
-            param_grid['stop_loss_multiplier']
-        ))
+        logger.info(f"开始回测，股票数量: {merged_5min_data['stock_code'].nunique()}，数据量: {len(merged_5min_data)}")
+        logger.info(f"回测参数: 止盈倍数={profit_multiplier}，止损倍数={stop_loss_multiplier}")
         
-        logger.info(f"参数组合总数: {len(param_combinations)}")
+        # 重置状态
+        self.cash = self.initial_capital
+        self.positions.clear()
+        self.trade_records.clear()
+        self.equity_curve = [self.initial_capital]
+        self.equity_dates.clear()
+        self.daily_positions.clear()
         
-        optimization_results = []
-        best_score = -float('inf')
-        best_params = None
+        # 按时间排序
+        merged_5min_data = merged_5min_data.sort_index()
         
-        for i, (fast, slow, signal, profit_mult, stop_mult) in enumerate(param_combinations, 1):
-            if slow <= fast:
-                logger.debug(f"跳过无效参数组合: 慢线({slow}) <= 快线({fast})")
+        # 跟踪每只股票的上一个信号（用于检测信号变化）
+        prev_signals: Dict[str, int] = {}
+        
+        # 主回测循环
+        last_processed_date = None
+        
+        logger.info("开始主回测循环...")
+        
+        for idx, row in merged_5min_data.iterrows():
+            current_dt = idx
+            current_date = current_dt.date()
+            stock_code = row['stock_code']
+            current_price = row['close']
+            
+            # 初始化信号跟踪
+            if stock_code not in prev_signals:
+                prev_signals[stock_code] = 0
+                logger.debug(f"初始化股票 {stock_code} 的信号跟踪")
+            
+            # 获取滚动计算器
+            if stock_code not in self.calculators:
+                logger.warning(f"股票 {stock_code} 没有对应的计算器，跳过")
                 continue
             
-            try:
-                # 创建回测引擎
-                backtest_engine = MultiStockBacktestEngine(
-                    initial_capital=100000.0,
-                    fixed_buy_amount=fixed_buy_amount,
-                    high_price_limit=500.0,
-                    max_single_position_pct=0.1
-                )
-                backtest_engine.set_transaction_cost_func(self.strategy.calculate_transaction_cost)
+            calculator = self.calculators[stock_code]
+            
+            # 更新滚动计算器并获取实时指标
+            indicators = calculator.update(
+                current_dt,
+                row['open'],
+                row['high'],
+                row['low'],
+                current_price,
+                row.get('volume', 0)
+            )
+            
+            current_signal = indicators['signal']
+            current_atr = indicators['atr']
+            current_daily_close_est = indicators['daily_close_est']
+            
+            # 更新权益曲线（每天记录一次）
+            if last_processed_date != current_date:
+                self._update_equity_curve(current_dt, merged_5min_data)
+                last_processed_date = current_date
+            
+            # === 卖出逻辑 ===
+            if stock_code in self.positions:
+                position = self.positions[stock_code]
                 
-                # 初始化计算器
-                backtest_engine.initialize_calculators(
-                    warmup_data, fast, slow, signal
-                )
-                
-                # 在训练集上回测
-                logger.info(f"==> 开始测试参数组合 {i}/{len(param_combinations)}: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
-                logger.debug(f"训练数据: {warmup_data}")
-                results = backtest_engine.run_backtest(
-                    train_data,
-                    profit_multiplier=profit_mult,
-                    stop_loss_multiplier=stop_mult
-                )
-                
-                # 计算综合评分（考虑收益率、回撤、夏普比率）
-                score = (
-                    results['annual_return'] * 0.4 +
-                    (1 - abs(results['max_drawdown'])) * 0.3 +
-                    results['sharpe_ratio'] * 0.3
-                )
-                
-                optimization_results.append({
-                    'fast_period': fast,
-                    'slow_period': slow,
-                    'signal_period': signal,
-                    'profit_multiplier': profit_mult,
-                    'stop_loss_multiplier': stop_mult,
-                    'total_return': results['total_return'],
-                    'annual_return': results['annual_return'],
-                    'max_drawdown': results['max_drawdown'],
-                    'sharpe_ratio': results['sharpe_ratio'],
-                    'win_rate': results['win_rate'],
-                    'trade_count': results['trade_count'],
-                    'avg_position_count': results['avg_position_count'],
-                    'score': score
-                })
-                logger.info(f"<== 结束测试参数组合 {i}/{len(param_combinations)}: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
-                logger.info(f"当前参数组合结果: {optimization_results[-1]}")
-                # 更新最佳参数
-                if score > best_score:
-                    best_score = score
-                    best_params = (fast, slow, signal, profit_mult, stop_mult)
-                    logger.info(f"发现新的最佳参数: {best_params}，得分: {score:.4f}")
-                
-                if i % 5 == 0 or i == 1 or i == len(param_combinations):
-                    logger.info(f"进度: {i}/{len(param_combinations)} | "
-                                f"当前最佳: {best_params} | 得分: {best_score:.4f}")
+                # T+1检查
+                if position.entry_date >= current_date:
+                    # 不能卖出，跳过
+                    logger.debug(f"股票 {stock_code} 今日买入，T+1规则不允许卖出")
+                else:
+                    # 检查卖出条件
+                    sell_reason = None
                     
-            except Exception as e:
-                logger.error(f"参数组合 {fast},{slow},{signal},{profit_mult},{stop_mult} 回测失败: {str(e)[:50]}")
-                continue
+                    # 条件1: 实时死叉信号
+                    if current_signal == -1 and prev_signals[stock_code] != -1:
+                        sell_reason = 'SELL_SIGNAL'
+                        logger.info(f"股票 {stock_code} 触发死叉信号卖出")
+                    
+                    # 条件2: 止盈
+                    elif position.check_profit_target(current_price, profit_multiplier):
+                        sell_reason = 'SELL_PROFIT'
+                    
+                    # 条件3: 止损
+                    elif position.check_stop_loss(current_price, stop_loss_multiplier):
+                        sell_reason = 'SELL_STOPLOSS'
+                    
+                    if sell_reason:
+                        # 执行卖出
+                        trade_value = position.shares * current_price
+                        cost = self.transaction_cost_func(trade_value, is_buy=False)
+                        self.cash += trade_value - cost
+                        
+                        pnl_amount, pnl_pct = position.calculate_pnl(current_price)
+                        
+                        self.trade_records.append({
+                            'datetime': current_dt,
+                            'stock_code': stock_code,
+                            'action': sell_reason,
+                            'price': current_price,
+                            'shares': position.shares,
+                            'value': trade_value,
+                            'cost': cost,
+                            'pnl_amount': pnl_amount,
+                            'pnl_pct': pnl_pct,
+                            'entry_price': position.entry_price,
+                            'holding_days': (current_date - position.entry_date).days
+                        })
+                        
+                        logger.info(f"{current_dt} 卖出 {stock_code}: {position.shares}股 @ {current_price:.2f}元, 原因: {sell_reason}, 盈亏: {pnl_pct:.2%}")
+                        
+                        # 移除持仓
+                        del self.positions[stock_code]
+                        logger.debug(f"移除股票 {stock_code} 的持仓记录")
+            
+            # === 买入逻辑 ===
+            # 条件：出现金叉信号 + 无该股票持仓 + 有可用资金
+            if (current_signal == 1 and prev_signals[stock_code] != 1 and 
+                stock_code not in self.positions and self.cash > 10000):  # 至少留1万元现金
+                
+                logger.info(f"股票 {stock_code} 触发金叉信号，尝试买入")
+                
+                # 计算可买股数
+                shares, cost = self.calculate_shares_to_buy(stock_code, current_price, self.cash)
+                
+                if shares >= 100:  # 至少能买1手
+                    # 计算交易成本
+                    transaction_cost = self.transaction_cost_func(cost, is_buy=True)
+                    total_cost = cost + transaction_cost
+                    
+                    if total_cost <= self.cash:
+                        # 执行买入
+                        self.cash -= total_cost
+                        
+                        self.positions[stock_code] = PositionRecord(
+                            stock_code=stock_code,
+                            entry_date=current_date,
+                            entry_price=current_price,
+                            shares=shares,
+                            entry_daily_close=current_daily_close_est,
+                            entry_atr=current_atr
+                        )
+                        
+                        self.trade_records.append({
+                            'datetime': current_dt,
+                            'stock_code': stock_code,
+                            'action': 'BUY',
+                            'price': current_price,
+                            'shares': shares,
+                            'value': cost,
+                            'cost': transaction_cost,
+                            'basis_close': current_daily_close_est,
+                            'atr': current_atr
+                        })
+                        
+                        logger.info(f"{current_dt} 买入 {stock_code}: {shares}股 @ {current_price:.2f}元, 成本: {cost:,.2f}元")
+                    else:
+                        logger.warning(f"{current_dt} 资金不足，无法买入 {stock_code}: 所需 {total_cost:,.2f}元, 可用 {self.cash:,.2f}元")
+                else:
+                    logger.warning(f"{current_dt} 无法买入 {stock_code}: 计算股数 {shares} < 100股")
+            
+            # 更新上一个信号
+            prev_signals[stock_code] = current_signal
         
-        # 5. 整理结果
-        results_df = pd.DataFrame(optimization_results)
-        if not results_df.empty:
-            results_df = results_df.sort_values('score', ascending=False).reset_index(drop=True)
-            logger.info(f"参数优化完成，有效组合数: {len(results_df)}")
-        else:
-            logger.warning("没有有效的参数组合结果")
+        # 回测结束，平仓所有持仓
+        logger.info("回测循环结束，开始平仓所有持仓")
+        self._close_all_positions(merged_5min_data)
         
-        return best_params, results_df
-    
-    def validate_parameters(self, stock_pool: List[str], start_date: str, end_date: str,
-                           params: Tuple, fixed_buy_amount: float = 50000.0,
-                           warmup_days: int = 100) -> Dict:
-        """
-        在测试集上验证参数
-        """
-        fast, slow, signal, profit_mult, stop_mult = params
+        # 计算最终绩效
+        logger.info("计算最终绩效指标")
+        results = self._calculate_performance_metrics()
+        results['trade_records'] = self.trade_records
+        results['equity_curve'] = self.equity_curve
+        results['equity_dates'] = self.equity_dates
         
-        logger.info(f"开始参数验证: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
-        
-        # 准备数据
-        warmup_end_date = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-        warmup_data = self.data_fetcher.prepare_warmup_data(
-            stock_pool, warmup_days, warmup_end_date
-        )
-        
-        min_data = self.data_fetcher.get_5min_data_batch(stock_pool, start_date, end_date)
-        merged_min_data = self.data_fetcher.merge_multi_stock_data(min_data)
-        
-        if merged_min_data.empty:
-            logger.error("验证数据为空")
-            return {}
-        
-        # 划分测试集（后30%）
-        split_idx = int(len(merged_min_data) * 0.7)
-        test_data = merged_min_data.iloc[split_idx:].copy()
-        
-        logger.info(f"验证数据集: {len(test_data)} 条记录")
-        
-        # 创建回测引擎
-        backtest_engine = MultiStockBacktestEngine(
-            initial_capital=1000000.0,
-            fixed_buy_amount=fixed_buy_amount,
-            high_price_limit=500.0
-        )
-        backtest_engine.set_transaction_cost_func(self.strategy.calculate_transaction_cost)
-        
-        # 初始化计算器
-        backtest_engine.initialize_calculators(warmup_data, fast, slow, signal)
-        
-        # 执行回测
-        results = backtest_engine.run_backtest(
-            test_data,
-            profit_multiplier=profit_mult,
-            stop_loss_multiplier=stop_mult
-        )
-        
-        logger.info(f"参数验证完成，最终权益: {results.get('final_equity', 0):,.2f}元")
+        logger.info(f"回测完成，总交易次数: {results['trade_count']}，最终权益: {results['final_equity']:,.2f}元")
         
         return results
     
-    def run_full_backtest(self, stock_pool: List[str], start_date: str, end_date: str,
-                         params: Tuple, fixed_buy_amount: float = 50000.0,
-                         warmup_days: int = 100) -> Tuple[Dict, pd.DataFrame]:
-        """
-        在整个周期上运行完整回测
-        """
-        fast, slow, signal, profit_mult, stop_mult = params
+    def _update_equity_curve(self, current_dt, data_source):
+        """更新权益曲线"""
+        # 计算当前总资产
+        total_value = self.cash
         
-        logger.info(f"执行完整回测，参数: F={fast}, M={slow}, SIG={signal}, Y={profit_mult}, S={stop_mult}")
+        position_details = []
+        for stock_code, position in self.positions.items():
+            # 找到该股票当前最新的价格
+            stock_data = data_source[data_source['stock_code'] == stock_code]
+            if not stock_data.empty:
+                latest_price = stock_data.iloc[-1]['close']
+                position.update_value(latest_price)
+                total_value += position.current_value
+                position_details.append(f"{stock_code}: {position.shares}股 @ {latest_price:.2f}")
         
-        # 准备数据
-        warmup_end_date = (pd.to_datetime(start_date) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-        warmup_data = self.data_fetcher.prepare_warmup_data(
-            stock_pool, warmup_days, warmup_end_date
-        )
+        self.equity_curve.append(total_value)
+        self.equity_dates.append(current_dt)
         
-        min_data = self.data_fetcher.get_5min_data_batch(stock_pool, start_date, end_date)
-        merged_min_data = self.data_fetcher.merge_multi_stock_data(min_data)
+        logger.debug(f"更新权益曲线: 日期={current_dt}, 现金={self.cash:.2f}, 持仓市值={total_value-self.cash:.2f}, 总资产={total_value:.2f}")
+        if position_details:
+            logger.debug(f"持仓详情: {', '.join(position_details)}")
+    
+    def _close_all_positions(self, data_source):
+        """平仓所有持仓"""
+        if not self.positions:
+            logger.info("没有持仓需要平仓")
+            return
         
-        logger.info(f"完整回测数据准备完成，数据量: {len(merged_min_data)} 条记录")
+        logger.info(f"开始平仓，持仓数量: {len(self.positions)}")
         
-        # 创建回测引擎
-        backtest_engine = MultiStockBacktestEngine(
-            initial_capital=1000000.0,
-            fixed_buy_amount=fixed_buy_amount,
-            high_price_limit=500.0
-        )
-        backtest_engine.set_transaction_cost_func(self.strategy.calculate_transaction_cost)
+        for stock_code, position in list(self.positions.items()):
+            # 找到最后的价格
+            stock_data = data_source[data_source['stock_code'] == stock_code]
+            if not stock_data.empty:
+                final_price = stock_data.iloc[-1]['close']
+                
+                # 执行卖出
+                trade_value = position.shares * final_price
+                cost = self.transaction_cost_func(trade_value, is_buy=False)
+                self.cash += trade_value - cost
+                
+                pnl_amount, pnl_pct = position.calculate_pnl(final_price)
+                
+                self.trade_records.append({
+                    'datetime': data_source.index[-1],
+                    'stock_code': stock_code,
+                    'action': 'SELL_END',
+                    'price': final_price,
+                    'shares': position.shares,
+                    'value': trade_value,
+                    'cost': cost,
+                    'pnl_amount': pnl_amount,
+                    'pnl_pct': pnl_pct,
+                    'entry_price': position.entry_price,
+                    'holding_days': 'N/A'
+                })
+                
+                logger.info(f"平仓 {stock_code}: {position.shares}股 @ {final_price:.2f}元, 盈亏: {pnl_pct:.2%}")
         
-        # 初始化计算器
-        backtest_engine.initialize_calculators(warmup_data, fast, slow, signal)
+        self.positions.clear()
+        logger.info("所有持仓已平仓")
+    
+    def _calculate_performance_metrics(self) -> Dict:
+        """计算绩效指标"""
+        logger.info("开始计算绩效指标")
         
-        # 执行回测
-        results = backtest_engine.run_backtest(
-            merged_min_data,
-            profit_multiplier=profit_mult,
-            stop_loss_multiplier=stop_mult
-        )
+        if len(self.equity_curve) < 2:
+            logger.warning("权益曲线数据不足，返回默认绩效指标")
+            return {
+                'final_equity': self.initial_capital,
+                'total_return': 0,
+                'annual_return': 0,
+                'max_drawdown': 0,
+                'sharpe_ratio': 0,
+                'win_rate': 0,
+                'trade_count': 0,
+                'profit_trades': 0,
+                'avg_position_count': 0,
+                'cash_final': self.cash
+            }
         
-        # 生成股票分析
-        stock_analysis = backtest_engine.generate_stock_analysis()
+        final_equity = self.equity_curve[-1]
+        total_return = (final_equity - self.initial_capital) / self.initial_capital
         
-        logger.info(f"完整回测完成，最终权益: {results.get('final_equity', 0):,.2f}元")
+        logger.debug(f"计算收益率: 初始资金={self.initial_capital:,.2f}, 最终权益={final_equity:,.2f}, 总收益率={total_return:.2%}")
         
-        return results, stock_analysis
+        # 年化收益率
+        if len(self.equity_dates) > 1:
+            total_days = (self.equity_dates[-1] - self.equity_dates[0]).days
+            years = total_days / 365.25 if total_days > 0 else 0
+            annual_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+            logger.debug(f"年化收益率计算: 总天数={total_days}, 年数={years:.2f}, 年化收益={annual_return:.2%}")
+        else:
+            annual_return = 0
+            logger.warning("权益日期数据不足，无法计算年化收益率")
+        
+        # 最大回撤
+        equity_series = pd.Series(self.equity_curve[1:], index=self.equity_dates)  # 跳过初始值
+        cumulative_max = equity_series.expanding().max()
+        drawdown = (equity_series - cumulative_max) / cumulative_max
+        max_drawdown = drawdown.min()
+        
+        logger.debug(f"最大回撤计算: 最大回撤={max_drawdown:.2%}")
+        
+        # 交易统计
+        sell_trades = [t for t in self.trade_records if t['action'].startswith('SELL')]
+        winning_trades = [t for t in sell_trades if t.get('pnl_pct', 0) > 0]
+        
+        win_rate = len(winning_trades) / len(sell_trades) if sell_trades else 0
+        
+        logger.debug(f"交易统计: 卖出交易={len(sell_trades)}, 盈利交易={len(winning_trades)}, 胜率={win_rate:.2%}")
+        
+        # 夏普比率
+        daily_returns = equity_series.pct_change().dropna()
+        if len(daily_returns) > 0 and daily_returns.std() > 0:
+            sharpe_ratio = np.sqrt(250) * daily_returns.mean() / daily_returns.std()
+            logger.debug(f"夏普比率计算: 日收益率均值={daily_returns.mean():.4%}, 标准差={daily_returns.std():.4%}, 夏普比率={sharpe_ratio:.2f}")
+        else:
+            sharpe_ratio = 0
+            logger.warning("日收益率数据不足或标准差为0，无法计算夏普比率")
+        
+        # 平均持仓数量
+        if self.daily_positions:
+            avg_position_count = np.mean([len(pos) for pos in self.daily_positions])
+            logger.debug(f"平均持仓数量: {avg_position_count:.1f}")
+        else:
+            avg_position_count = 0
+            logger.debug("没有持仓记录，平均持仓数量为0")
+        
+        results = {
+            'final_equity': final_equity,
+            'total_return': total_return,
+            'annual_return': annual_return,
+            'max_drawdown': max_drawdown,
+            'sharpe_ratio': sharpe_ratio,
+            'win_rate': win_rate,
+            'trade_count': len(sell_trades),
+            'profit_trades': len(winning_trades),
+            'avg_position_count': avg_position_count,
+            'cash_final': self.cash,
+            'total_trades': len(self.trade_records)
+        }
+        
+        logger.info("绩效指标计算完成")
+        return results
+    
+    def generate_stock_analysis(self) -> pd.DataFrame:
+        """生成每只股票的分析报告"""
+        logger.info("开始生成股票分析报告")
+        
+        if not self.trade_records:
+            logger.warning("没有交易记录，无法生成股票分析")
+            return pd.DataFrame()
+        
+        # 按股票代码分组
+        stock_trades = {}
+        for trade in self.trade_records:
+            code = trade['stock_code']
+            if code not in stock_trades:
+                stock_trades[code] = {'buys': [], 'sells': []}
+            
+            if trade['action'] == 'BUY':
+                stock_trades[code]['buys'].append(trade)
+            elif trade['action'].startswith('SELL'):
+                stock_trades[code]['sells'].append(trade)
+        
+        logger.debug(f"按股票分组完成，涉及 {len(stock_trades)} 只股票")
+        
+        # 计算每只股票的绩效
+        analysis_rows = []
+        for code, trades in stock_trades.items():
+            if trades['sells']:
+                total_pnl = sum(t.get('pnl_amount', 0) for t in trades['sells'])
+                win_count = sum(1 for t in trades['sells'] if t.get('pnl_pct', 0) > 0)
+                trade_count = len(trades['sells'])
+                win_rate = win_count / trade_count if trade_count > 0 else 0
+                
+                analysis_rows.append({
+                    'stock_code': code,
+                    'trade_count': trade_count,
+                    'win_rate': win_rate,
+                    'total_pnl': total_pnl,
+                    'buy_count': len(trades['buys'])
+                })
+                
+                logger.debug(f"股票 {code}: 交易次数={trade_count}, 胜率={win_rate:.2%}, 总盈亏={total_pnl:.2f}元")
+        
+        df = pd.DataFrame(analysis_rows)
+        logger.info(f"股票分析报告生成完成，共分析 {len(df)} 只股票")
+        
+        return df
